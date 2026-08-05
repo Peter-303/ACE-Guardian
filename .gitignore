@@ -7,6 +7,10 @@ ACTIVE.flag
 
 # 临时与测试文件
 *.tmp
+_diag*
+_tick*
+_scope*
+_full*
 rr.ps1
 rr.txt
 perr.txt

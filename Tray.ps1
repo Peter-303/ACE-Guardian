@@ -8,11 +8,21 @@
     4. 简单状态面板（WinForms）
 #>
 $ErrorActionPreference = 'SilentlyContinue'
-$Root     = 'C:\ACE-Guardian'
-$AlertDir = "$Root\alerts"
-$Flag     = "$Root\ACTIVE.flag"
-$StateF   = "$Root\state.json"
-New-Item -ItemType Directory -Path $AlertDir -Force | Out-Null
+# 用 $script: 显式限定作用域：WinForms 事件 scriptblock 的变量查找不保证能命中
+# 脚本顶层的普通变量，缺失时 Get-ChildItem 会拿到空路径而静默失败。
+$script:Root     = 'C:\ACE-Guardian'
+$script:AlertDir = "$script:Root\alerts"
+$script:Flag     = "$script:Root\ACTIVE.flag"
+$script:StateF   = "$script:Root\state.json"
+$script:DiagLog  = "$script:Root\logs\tray-diag.log"
+New-Item -ItemType Directory -Path $script:AlertDir -Force | Out-Null
+
+# 托盘自身的问题必须能被看见：定时器里任何异常都写入独立诊断日志，
+# 不再用空 catch 吞掉（这正是"告警反复重弹"长期查不出原因的根源）。
+function Write-Diag {
+    param([string]$Msg)
+    try { Add-Content -Path $script:DiagLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Msg" -Encoding UTF8 } catch { }
+}
 
 # 单实例互斥，避免重复启动多个托盘图标。
 # 注意：上一个实例被强杀或未释放锁时，锁会变成 abandoned 状态，
@@ -81,7 +91,7 @@ function Get-Status {
 # ---------- 状态面板（独立进程，避免异常被吞） ----------
 # 直接启动即可：Panel.ps1 自带互斥，已开时会自行把已有窗口激活到前台
 function Show-Panel {
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"$Root\Panel.ps1"
+    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"$script:Root\Panel.ps1"
 }
 
 # ---------- 托盘 ----------
@@ -101,13 +111,13 @@ $ni.ContextMenuStrip = $menu
 
 $miPanel.Add_Click({ Show-Panel })
 $ni.Add_MouseDoubleClick({ Show-Panel })
-$miLog.Add_Click({ Start-Process explorer.exe "$Root\logs" })
+$miLog.Add_Click({ Start-Process explorer.exe "$script:Root\logs" })
 $miToggle.Add_Click({
-    if (Test-Path $Flag) {
-        Remove-Item $Flag -Force
+    if (Test-Path $script:Flag) {
+        Remove-Item $script:Flag -Force
         $ni.ShowBalloonTip(4000,'守护已关闭','正在执行退场检查：停止 ACE 驱动并复查系统状态…',[System.Windows.Forms.ToolTipIcon]::Info)
     } else {
-        Set-Content $Flag (Get-Date -Format 'u') -Encoding UTF8
+        Set-Content $script:Flag (Get-Date -Format 'u') -Encoding UTF8
         $ni.ShowBalloonTip(4000,'守护已开启','已进入激活态，可以启动游戏了。',[System.Windows.Forms.ToolTipIcon]::Info)
     }
 })
@@ -132,7 +142,19 @@ $timer.Add_Tick({
         }
         $miToggle.Text = if ($s.手动) { '关闭守护' } else { '开启守护' }
 
-        foreach ($fl in (Get-ChildItem $AlertDir -Filter '*.json' | Sort-Object LastWriteTime)) {
+        # 告警消费：每轮最多弹一条，但过期的一律清空，不留在队列里等下一轮重弹。
+        $files = @(Get-ChildItem $script:AlertDir -Filter '*.json' -ErrorAction Stop | Sort-Object LastWriteTime)
+        $popped = $false
+        foreach ($fl in $files) {
+            # 时效判定：告警描述的是"此刻正在发生的事"，过期后内容已失真，直接丢弃不弹。
+            $age = ((Get-Date) - $fl.LastWriteTime).TotalSeconds
+            if ($age -gt 120) {
+                Remove-Item $fl.FullName -Force -ErrorAction Stop
+                Write-Diag "丢弃过期告警 $($fl.Name)（已产生 $([int]$age) 秒）"
+                continue
+            }
+            if ($popped) { continue }   # 本轮已弹过，其余留到下轮（未过期，不会丢）
+
             $a = Get-Content $fl.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
             if ($a) {
                 # 托盘侧再去重一层：同一标题 5 分钟内不重复弹，防止刷屏
@@ -144,10 +166,13 @@ $timer.Add_Tick({
                     $ni.ShowBalloonTip(15000, $a.标题, $a.内容, [System.Windows.Forms.ToolTipIcon]::$ic)
                 }
             }
-            Remove-Item $fl.FullName -Force
-            break   # 每轮只弹一条，避免刷屏
+            # 删除必须成功，否则同一条会被无限重弹。失败就记下来，让问题暴露出来。
+            Remove-Item $fl.FullName -Force -ErrorAction Stop
+            $popped = $true
         }
-    } catch { }
+    } catch {
+        Write-Diag "定时器异常: $($_.Exception.GetType().FullName) -> $($_.Exception.Message)"
+    }
 })
 $timer.Start()
 
