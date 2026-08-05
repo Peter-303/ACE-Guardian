@@ -1,0 +1,16 @@
+# 运行时数据，不纳入版本控制
+logs/
+alerts/
+snapshots/
+state.json
+ACTIVE.flag
+
+# 临时与测试文件
+*.tmp
+rr.ps1
+rr.txt
+perr.txt
+ptest.ps1
+simtest.ps1
+restart*.ps1
+restart-result.txt

@@ -1,0 +1,34 @@
+{
+  "_说明": "ACE 管控系统配置。修改后无需重启任务，下一轮循环自动生效。",
+
+  "_进程分类说明": "三者职责不同不可混用：游戏本体=判定真实游戏会话（安全闸门依据）；登录器=准备玩游戏（触发激活但不作为退场依据）；ACE=被管控对象（绝不能作为游戏在跑的依据）",
+  "游戏本体进程名": ["VALORANT", "VALORANT-Win64-Shipping"],
+  "登录器进程名": ["ACLOS", "AclosGameProxy", "AclosLauncher", "RiotClientServices", "RiotClientUx", "RiotClientUxRender", "wegame", "TenioDL"],
+  "游戏退出宽限秒": 90,
+  "ACE进程名": ["SGuard64", "SGuardSvc64", "ACE-Tray", "AntiCheatExpert"],
+  "ACE服务前缀": ["ACE-", "ace-game", "AntiCheatExpert", "SGuard"],
+
+  "采集间隔秒_待机": 20,
+  "采集间隔秒_游戏中": 5,
+  "快照保留分钟": 15,
+
+  "管控开关": {
+    "强制ACE驱动为Manual": true,
+    "游戏退出后清理ACE残留": true,
+    "禁止ACE-BOOT开机常驻": true,
+    "磁盘抖动超阈值时告警": true,
+    "Defender崩溃时告警": true,
+    "WHEA错误时告警": true
+  },
+
+  "阈值": {
+    "磁盘抖动_次数": 5,
+    "磁盘抖动_窗口秒": 120,
+    "Defender崩溃_次数": 2,
+    "Defender崩溃_窗口秒": 300,
+    "内存提交率告警_百分比": 88
+  },
+
+  "弹窗": true,
+  "日志保留天数": 30
+}
