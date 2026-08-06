@@ -19,7 +19,8 @@
     "禁止ACE-BOOT开机常驻": true,
     "磁盘抖动超阈值时告警": true,
     "Defender崩溃时告警": true,
-    "WHEA错误时告警": true
+    "WHEA错误时告警": true,
+    "HVCI与ACE冲突时告警": true
   },
 
   "阈值": {

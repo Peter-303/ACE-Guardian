@@ -220,6 +220,47 @@ function Get-CrashAceCorrelation {
     return $结论
 }
 
+# 【2026-08-06 新增·核心根因防线】HVCI（内存完整性 / VBS）与 ACE 冲突检测。
+# 事故根因升级：用户曾为 Docker 启用 WSL2/虚拟化平台，连带打开了 HVCI（内存完整性）。
+# HVCI 用 hypervisor 强制校验一切内核代码与内存操作，而 ACE 反作弊驱动要做内核级
+# 内存读写——两者在内核层直接对撞：HVCI 拦截 ACE 的内存操作即触发
+# 0x139 KERNEL_SECURITY_CHECK_FAILURE 蓝屏。这正是"删了 ACE 就太平、装回来就崩、
+# 且与开不开游戏无关"的真正诱因（HVCI 与 ACE 驱动都开机常驻内核）。
+# 本函数每次开机自检检测 HVCI 是否正在运行；若开启则高优先级告警——因为这是
+# 比 ACE 内核常驻更根本的蓝屏元凶，且管控系统无权自动关闭 HVCI（需管理员显式操作+重启）。
+function Test-HvciConflict {
+    if (-not $Cfg.管控开关.'HVCI与ACE冲突时告警') { return $false }
+    $hvciOn = $false
+    try {
+        # 首选 DeviceGuard WMI：SecurityServicesRunning 含 2 表示 HVCI 正在运行
+        $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard -ErrorAction Stop
+        if ($dg.SecurityServicesRunning -contains 2) { $hvciOn = $true }
+    } catch {
+        # 回退到注册表判断
+        $k = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity'
+        if ((Test-Path $k) -and (Get-ItemProperty $k -EA SilentlyContinue).Enabled -eq 1) { $hvciOn = $true }
+    }
+    if (-not $hvciOn) {
+        Write-Log 'HVCI（内存完整性）未运行，与 ACE 无内核冲突风险' 'INFO'
+        return $false
+    }
+    # HVCI 开着——检测 ACE 是否存在（磁盘有 ACE 才构成实际冲突）
+    $aceExists = (Test-Path 'C:\Program Files\AntiCheatExpert') -or (Test-Path 'C:\ProgramData\AntiCheatExpert') -or
+                 ((Get-ChildItem 'C:\Windows\System32\drivers\ACE-*.sys' -EA SilentlyContinue).Count -gt 0) -or
+                 ((Get-AceServices).Count -gt 0)
+    if ($aceExists) {
+        Write-Log '⚠️ 检测到 HVCI（内存完整性）与 ACE 同时存在——这是 0x139 蓝屏的直接内核诱因！' 'ALERT'
+        $提示 = "检测到【内存完整性 / HVCI】正在运行，同时系统里存在 ACE 反作弊驱动。`n`n这两者在内核层水火不容：HVCI 会拦截 ACE 的内核内存操作并直接触发蓝屏/重启（停止码 0x139）——这正是你之前反复崩溃的真正根因。`n`nHVCI 是你启用 Docker/WSL2 虚拟化时连带打开的。若要长期稳定运行 ACE 游戏，需关闭内存完整性并重启：`n设置→隐私和安全性→Windows 安全中心→设备安全性→内核隔离→内存完整性→关闭，然后重启。`n`n管控系统无权自动关闭它（属系统级安全设置），需你手动操作。"
+        Send-Alert 'HVCI 与 ACE 冲突（蓝屏根因）' $提示 'Error' 60
+        return $true
+    } else {
+        # HVCI 开着但当前无 ACE：记录备忘，等 ACE 装回来时会在下次开机自检触发告警
+        Write-Log 'HVCI（内存完整性）正在运行；当前无 ACE，暂无冲突。装回 ACE 前建议先关闭内存完整性以防 0x139 蓝屏' 'WARN'
+        Send-Alert 'HVCI 正在运行（装 ACE 前需关闭）' "检测到【内存完整性 / HVCI】正在运行（你启用 Docker/WSL2 时连带打开的）。`n`n当前系统无 ACE，暂无冲突。但一旦你重装 Valorant，ACE 驱动会与 HVCI 在内核层对撞触发 0x139 蓝屏。`n`n建议在装回游戏前先关闭内存完整性并重启：设置→隐私和安全性→Windows 安全中心→设备安全性→内核隔离→内存完整性→关闭。" 'Warning' 240
+        return $false
+    }
+}
+
 function Stop-AceProcs {
     # 安全闸门：游戏本体或登录器在跑时绝不杀 ACE 进程
     $阻 = Test-干预禁止
@@ -401,6 +442,12 @@ Write-Log "===== ACE-Guardian v2 启动 (PID $PID) =====" 'INFO'
 $bootIssues = @()
 $n = Enforce-ManualStart
 if ($n -gt 0) { $bootIssues += "修正了 $n 个 ACE 驱动的启动类型" }
+
+# 【核心根因防线】HVCI（内存完整性/VBS）与 ACE 冲突自检。
+# 这是比 ACE 内核常驻更根本的 0x139 蓝屏诱因，放在最前面优先暴露。
+if (Test-HvciConflict) {
+    $bootIssues += "HVCI（内存完整性）与 ACE 同时存在——0x139 蓝屏根因，需手动关闭内存完整性并重启"
+}
 
 # 开机时若 ACE 内核驱动已在运行（且未开游戏），说明它又开机自启了，
 # 走统一的实时预警+安全干预（降级+杀进程+醒目告知需重启）
