@@ -136,6 +136,7 @@ $miToggle = $menu.Items.Add('开启守护')
 $menu.Items.Add('-') | Out-Null
 $miLog    = $menu.Items.Add('打开日志文件夹')
 $menu.Items.Add('-') | Out-Null
+$miShutdown = $menu.Items.Add('彻底关闭管控（需手动再启动）')
 $miExit   = $menu.Items.Add('退出托盘（守护仍继续运行）')
 $ni.ContextMenuStrip = $menu
 
@@ -167,6 +168,27 @@ $miToggle.Add_Click({
     }
 })
 $miExit.Add_Click({ $ni.Visible = $false; [System.Windows.Forms.Application]::Exit() })
+# 彻底关闭：停守护+托盘进程、禁用开机自启，直到手动运行 彻底启动.ps1。
+# 区别于"休眠"（进程还在）和"退出托盘"（守护仍跑）——本操作让整个管控 0 进程 0 自启。
+# 禁用计划任务需要管理员权限，故用 -Verb RunAs 提权调用外部脚本。
+$miShutdown.Add_Click({
+    $r = [System.Windows.Forms.MessageBox]::Show(
+        "确定要彻底关闭 ACE 管控系统吗？`n`n将结束守护与托盘进程，并禁用开机自启，直到你手动运行 彻底启动.ps1 为止（0 进程 0 占用）。`n`n注意：本操作不碰 ACE 本身。若此刻 ACE 内核驱动仍在运行，关闭后将不再对其预警或干预。",
+        '彻底关闭管控',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    try {
+        Start-Process powershell.exe -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"$script:Root\彻底关闭.ps1" -ErrorAction Stop
+    } catch {
+        Write-Diag "调用彻底关闭失败: $($_.Exception.Message)"
+        $ni.ShowBalloonTip(5000,'操作已取消','未获得管理员授权，管控未关闭。',[System.Windows.Forms.ToolTipIcon]::Warning)
+        return
+    }
+    # 彻底关闭脚本会把本托盘进程也一并结束；这里主动退出确保图标即时消失、互斥释放。
+    $ni.Visible = $false
+    [System.Windows.Forms.Application]::Exit()
+})
 # ---------- 主定时器：更新图标 + 消费告警 ----------
 $script:Shown = @{}   # 已弹过的告警标题 -> 时间，用于去重
 $timer = New-Object System.Windows.Forms.Timer

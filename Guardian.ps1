@@ -161,6 +161,65 @@ function Disable-AceDrivers {
     return $disabled
 }
 
+# 【2026-08-06 新增·核心盲区修复】ACE 内核驱动实时预警 + 安全全干预。
+# 事故教训：用户"没开游戏"时 ACE 内核驱动仍 7×24 常驻运行，是崩溃的直接诱因，
+# 而旧守护对"ACE 内核驱动正在运行"这件事既无实时感知也无醒目预警——用户完全不知情。
+# 本函数在每轮巡检明确检测 ACE 内核驱动是否 Running，并在无游戏时做"能安全做的全部干预"：
+#   1) 降级注册表 Start=Disabled（确保下次开机绝不加载）
+#   2) 杀掉 ACE 用户态进程（可安全杀，不蓝屏）
+#   3) 醒目预警：内核驱动无法运行时安全卸载（强拆=0x139 蓝屏），唯一彻底清除方式是重启
+# 铁律：绝不运行时 sc stop 卸载已加载的内核驱动。重启的选择权始终交给用户。
+function Test-AceKernelActive {
+    param([switch]$静默态)
+    $running = @(Get-AceServices | Where-Object { $_.State -eq 'Running' })
+    if ($running.Count -eq 0) { return $false }
+
+    # 安全闸门：游戏/登录器在跑时不动 ACE（游戏中它本就该运行），只记录不干预
+    $阻 = Test-干预禁止
+    if ($阻) {
+        Write-Log "ACE 内核驱动运行中（$(($running|Select -Expand Name) -join ',')），但$阻，不干预" 'INFO'
+        return $true
+    }
+
+    $names = ($running | Select -Expand Name) -join '、'
+    # 干预步骤1：降级注册表，堵住下次开机自启
+    $disabled = Disable-AceDrivers
+    # 干预步骤2：杀用户态进程（安全）
+    $killed = Stop-AceProcs
+
+    Write-Log "⚠️ 检测到 ACE 内核驱动正在运行: $names（已降级注册表+清理进程，但内核实例需重启才彻底卸载）" 'ALERT'
+    $提示 = "ACE 反作弊内核驱动（$names）此刻正在你的电脑内核中运行——它开机就常驻，与开不开游戏无关，这正是空闲时也可能崩溃的诱因。`n`n已阻止其下次开机自启并清理了后台进程，但已加载进内核的实例无法在运行时安全卸载（强行卸载会导致蓝屏），彻底清除的唯一安全方式是重启电脑。`n`n建议在方便时重启一次。"
+    Send-Alert 'ACE 内核驱动正在运行' $提示 'Warning' 30
+    return $true
+}
+
+# 【2026-08-06 新增·自动取证】崩溃与 ACE 活跃的关联分析。
+# 事故教训：崩溃(BSOD/非正常关机)与 ACE 活跃的规律，这次是靠人工翻日志才发现的。
+# 本函数在开机自检发现上次非正常关机时，自动回看崩溃前 24h 内 ACE 是否安装/活跃，
+# 把关联结论写入专门的取证日志(forensics-*.log)，长期自动积累证据，供判定根因。
+function Get-CrashAceCorrelation {
+    param([datetime]$CrashTime)
+    $窗口开始 = $CrashTime.AddHours(-24)
+    # 查崩溃前 24h 内的 ACE 服务安装事件(7045)——ACE 每次开游戏都会重装，是"当时活跃"的可靠指标
+    $aceEvents = @(Get-WinEvent -FilterHashtable @{LogName='System'; Id=7045; StartTime=$窗口开始; EndTime=$CrashTime} -EA SilentlyContinue |
+        Where-Object { $_.Message -match 'ACE|AntiCheat|SGuard|SSC-DRV' })
+    # 崩溃当时磁盘上是否存在 ACE 程序
+    $aceExists = (Test-Path 'C:\Program Files\AntiCheatExpert') -or (Test-Path 'C:\ProgramData\AntiCheatExpert') -or
+                 ((Get-ChildItem 'C:\Windows\System32\drivers\ACE-*.sys' -EA SilentlyContinue).Count -gt 0)
+
+    $结论 = if ($aceEvents.Count -gt 0) {
+        "崩溃前 24h 内 ACE 活跃 $($aceEvents.Count) 次（末次 $(($aceEvents|Sort TimeCreated|Select -Last 1).TimeCreated.ToString('MM-dd HH:mm'))）—— ACE 高度相关"
+    } elseif ($aceExists) {
+        "崩溃前 24h 无 ACE 安装事件，但磁盘存在 ACE 程序（常驻内核可能仍在跑）—— ACE 疑似相关"
+    } else {
+        "崩溃前 24h 无 ACE 活跃、磁盘也无 ACE —— 本次崩溃与 ACE 无关，指向其他原因（供电/散热/硬件）"
+    }
+    $line = "{0} 崩溃 @ {1} | {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CrashTime.ToString('yyyy-MM-dd HH:mm:ss'), $结论
+    Add-Content -Path ("$Root\logs\forensics-{0}.log" -f (Get-Date -Format 'yyyyMMdd')) -Value $line -Encoding UTF8
+    Write-Log "崩溃取证: $结论" 'ALERT'
+    return $结论
+}
+
 function Stop-AceProcs {
     # 安全闸门：游戏本体或登录器在跑时绝不杀 ACE 进程
     $阻 = Test-干预禁止
@@ -308,24 +367,21 @@ function Invoke-IdleCheck {
     # 防 ACE 偷偷把自己改回开机常驻
     Enforce-ManualStart | Out-Null
 
-    # 核心：游戏没开却有 ACE 在跑，说明它在后台扫盘/驻留，直接停掉
-    # 此时游戏未运行，ACE 不在检测会话中，停它不会触发误封
     if ($Cfg.管控开关.游戏退出后清理ACE残留) {
-        $procs = Get-AceProcs
-        if ($procs.Count) {
-            $k = Stop-AceProcs
-            if ($k.Count) {
-                Write-Log "静默态清理 ACE 后台进程: $($k -join ', ')" 'ACTION'
-                Send-Alert 'ACE 后台活动已拦截' "游戏未运行，但 ACE 进程 $($k -join '、') 在后台活动（通常是全盘扫描）。已结束，不影响下次开游戏。" 'Warning' 30
-            }
-        }
-        $run = @(Get-AceServices | Where-Object { $_.State -eq 'Running' })
-        if ($run.Count) {
-            # 只降级注册表启动类型，不运行时卸载（防 0x139 蓝屏）
-            $s = Disable-AceDrivers
-            if ($s.Count) {
-                Write-Log "静默态降级 ACE 驱动为 Disabled: $($s -join ', ')（重启后不再加载）" 'ACTION'
-                Send-Alert 'ACE 驱动已降级' "游戏未运行，已将 $($s.Count) 个 ACE 内核驱动设为 Disabled，重启后不再随机自启。运行时不卸载以防蓝屏。" 'Warning' 30
+        # 核心盲区修复：内核驱动实时预警+安全全干预。
+        # Test-AceKernelActive 内部已合并"降级注册表+杀进程+醒目预警"，
+        # 覆盖了旧版分散的进程清理与驱动降级逻辑，且新增了内核常驻的显式告警。
+        $kernelActive = Test-AceKernelActive -静默态
+
+        # 兜底：即便内核驱动未 Running，仍可能有 ACE 用户态进程在后台扫盘，单独清理
+        if (-not $kernelActive) {
+            $procs = Get-AceProcs
+            if ($procs.Count) {
+                $k = Stop-AceProcs
+                if ($k.Count) {
+                    Write-Log "静默态清理 ACE 后台进程: $($k -join ', ')" 'ACTION'
+                    Send-Alert 'ACE 后台活动已拦截' "游戏未运行，但 ACE 进程 $($k -join '、') 在后台活动（通常是全盘扫描）。已结束，不影响下次开游戏。" 'Warning' 30
+                }
             }
         }
     }
@@ -345,15 +401,20 @@ Write-Log "===== ACE-Guardian v2 启动 (PID $PID) =====" 'INFO'
 $bootIssues = @()
 $n = Enforce-ManualStart
 if ($n -gt 0) { $bootIssues += "修正了 $n 个 ACE 驱动的启动类型" }
-$runAce = @(Get-AceServices | Where-Object { $_.State -eq 'Running' })
-if ($runAce.Count -and (Get-GameProcs).Count -eq 0) {
-    $bootIssues += "开机时发现 $($runAce.Count) 个 ACE 驱动在运行但游戏未启动"
-    # 只降级注册表，不运行时卸载（防蓝屏）；重启后即不再加载
-    Disable-AceDrivers | Out-Null
+
+# 开机时若 ACE 内核驱动已在运行（且未开游戏），说明它又开机自启了，
+# 走统一的实时预警+安全干预（降级+杀进程+醒目告知需重启）
+if ((Get-GameProcs).Count -eq 0) {
+    if (Test-AceKernelActive) {
+        $bootIssues += "开机时 ACE 内核驱动已在运行（已阻止下次自启，彻底清除需重启）"
+    }
 }
+
 $lastBsod = @(Get-WinEvent -FilterHashtable @{LogName='System'; Id=41} -MaxEvents 1)
 if ($lastBsod.Count -and $lastBsod[0].TimeCreated -gt (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.AddMinutes(-2)) {
     $bootIssues += '上次为非正常关机'
+    # 自动取证：回看崩溃前 24h 内 ACE 是否活跃，写入 forensics 日志长期积累证据
+    Get-CrashAceCorrelation -CrashTime $lastBsod[0].TimeCreated | Out-Null
 }
 
 if ($bootIssues.Count) {
