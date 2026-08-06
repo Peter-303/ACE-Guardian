@@ -129,24 +129,36 @@ function Enforce-ManualStart {
     return $n
 }
 
-function Stop-AceDrivers {
-    # 安全闸门：游戏本体或登录器在跑时绝不停 ACE 驱动，否则 ACE 会认为被攻击并可能上报
+# 【2026-08-06 事故修复】禁止运行时停止/卸载 ACE 内核驱动。
+# 事故根因：旧版对已加载进内核的 ACE 驱动执行 `sc.exe stop`，内核拆解其
+# 注册的 LIST_ENTRY 链表时检测到结构损坏，触发 0x139 KERNEL_SECURITY_CHECK_FAILURE
+# 蓝屏（8/3 两次、8/6 一次，均由此动作导致）。
+# 正确做法：绝不在运行时卸载内核驱动，只把启动类型降级为 Disabled，重启后自然不加载。
+function Disable-AceDrivers {
+    # 安全闸门：游戏本体或登录器在跑时绝不动 ACE，否则 ACE 会认为被攻击并可能上报
     $阻 = Test-干预禁止
     if ($阻) {
-        Write-Log "$阻，跳过停止 ACE 驱动（防止误封）" 'WARN'
+        Write-Log "$阻，跳过降级 ACE 驱动（防止误封）" 'WARN'
         return @()
     }
-    $stopped = @()
+    $disabled = @()
     foreach ($s in Get-AceServices) {
+        # 只改注册表启动类型，不碰运行时状态。已加载的驱动会继续在内核里跑到下次重启，
+        # 这是内核安全模型允许的唯一无损做法——强行 sc stop 才是蓝屏元凶。
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$($s.Name)"
+        if ((Test-Path $key) -and $s.Start -ne 4) {
+            try {
+                Set-ItemProperty -Path $key -Name Start -Value 4 -Type DWord -ErrorAction Stop
+                if ((Get-ItemProperty $key).Start -eq 4) { $disabled += $s.Name }
+            } catch {
+                Write-Log "降级 $($s.Name) 失败: $($_.Exception.Message)" 'WARN'
+            }
+        }
         if ($s.State -eq 'Running') {
-            & sc.exe stop $s.Name *>$null
-            Start-Sleep -Milliseconds 600
-            $d = Get-CimInstance Win32_SystemDriver -Filter "Name='$($s.Name)'"
-            if ($d.State -ne 'Running') { $stopped += $s.Name }
-            else { Write-Log "$($s.Name) 停止失败（内核驱动通常需重启才能卸载，属正常）" 'INFO' }
+            Write-Log "$($s.Name) 已加载进内核，运行时不卸载（防蓝屏），已设为 Disabled，重启后不再加载" 'INFO'
         }
     }
-    return $stopped
+    return $disabled
 }
 
 function Stop-AceProcs {
@@ -243,25 +255,24 @@ function Save-Snapshot {
 # ---------- 退场检查：关游戏时主动执行 ----------
 function Invoke-ExitCheck {
     Write-Log '===== 开始退场检查 =====' 'WARN'
-    Send-Alert '游戏已退出，开始退场检查' '正在停止 ACE 内核驱动并检查系统状态...' 'Info' 10
+    Send-Alert '游戏已退出，开始退场检查' '正在处理 ACE 残留并检查系统状态...' 'Info' 10
     $issues = @()
 
-    # 1. 停 ACE 驱动
-    $stopped = Stop-AceDrivers
-    if ($stopped.Count) { Write-Log "已停止 ACE 驱动: $($stopped -join ', ')" 'ACTION' }
+    # 1. 降级 ACE 驱动（改注册表，重启生效；绝不运行时卸载，防 0x139 蓝屏）
+    $disabled = Disable-AceDrivers
+    if ($disabled.Count) { Write-Log "已将 ACE 驱动降级为 Disabled: $($disabled -join ', ')（重启后不再加载）" 'ACTION' }
 
     # 2. 结束 ACE 用户态进程
     $killed = Stop-AceProcs
     if ($killed.Count) { Write-Log "已结束 ACE 进程: $($killed -join ', ')" 'ACTION' }
 
-    # 3. 确保启动类型是 Manual
-    Enforce-ManualStart | Out-Null
+    # 3. （已在第 1 步统一降级为 Disabled，无需再设 Manual）
 
-    # 4. 复查（驱动已加载进内核时无法卸载，属正常现象，不算问题）
+    # 4. 复查（驱动已加载进内核时运行时不卸载，重启后失效，属正常现象，不算问题）
     Start-Sleep -Seconds 2
     $still = @(Get-AceServices | Where-Object { $_.State -eq 'Running' })
     if ($still.Count) {
-        Write-Log "仍在内核中的 ACE 驱动: $(($still|Select -Expand Name) -join ',')（已设为 Manual，重启后不再加载）" 'INFO'
+        Write-Log "仍在内核中的 ACE 驱动: $(($still|Select -Expand Name) -join ',')（已设为 Disabled，重启后不再加载，运行时不卸载以防蓝屏）" 'INFO'
     }
     $sp = Get-AceProcs
     if ($sp.Count) { $issues += "仍有 ACE 用户态进程: $(($sp|Select -Expand Name) -join ',')" }
@@ -274,8 +285,8 @@ function Invoke-ExitCheck {
     if ($w -gt 0) { $issues += "本次开机有 $w 条 WHEA 硬件错误" }
 
     if ($issues.Count -eq 0) {
-        Write-Log '退场检查通过：ACE 已全部停止，无异常，回落静默态' 'PASS'
-        Send-Alert '退场检查通过' "ACE 驱动已全部停止$(if($stopped.Count){"（$($stopped.Count) 个）"})，系统无异常。已进入静默态。" 'Info' 10
+        Write-Log '退场检查通过：ACE 已降级处理，无异常，回落静默态' 'PASS'
+        Send-Alert '退场检查通过' "ACE 驱动已降级为 Disabled$(if($disabled.Count){"（$($disabled.Count) 个，重启后不再加载）"})，系统无异常。已进入静默态。" 'Info' 10
         return $true
     } else {
         Write-Log "退场检查发现问题: $($issues -join '; ')" 'WARN'
@@ -310,10 +321,11 @@ function Invoke-IdleCheck {
         }
         $run = @(Get-AceServices | Where-Object { $_.State -eq 'Running' })
         if ($run.Count) {
-            $s = Stop-AceDrivers
+            # 只降级注册表启动类型，不运行时卸载（防 0x139 蓝屏）
+            $s = Disable-AceDrivers
             if ($s.Count) {
-                Write-Log "静默态停止 ACE 驱动: $($s -join ', ')" 'ACTION'
-                Send-Alert 'ACE 驱动已停止' "游戏未运行，已停止 $($s.Count) 个 ACE 内核驱动，避免后台扫盘。开游戏时会自动重新加载。" 'Warning' 30
+                Write-Log "静默态降级 ACE 驱动为 Disabled: $($s -join ', ')（重启后不再加载）" 'ACTION'
+                Send-Alert 'ACE 驱动已降级' "游戏未运行，已将 $($s.Count) 个 ACE 内核驱动设为 Disabled，重启后不再随机自启。运行时不卸载以防蓝屏。" 'Warning' 30
             }
         }
     }
@@ -336,7 +348,8 @@ if ($n -gt 0) { $bootIssues += "修正了 $n 个 ACE 驱动的启动类型" }
 $runAce = @(Get-AceServices | Where-Object { $_.State -eq 'Running' })
 if ($runAce.Count -and (Get-GameProcs).Count -eq 0) {
     $bootIssues += "开机时发现 $($runAce.Count) 个 ACE 驱动在运行但游戏未启动"
-    Stop-AceDrivers | Out-Null
+    # 只降级注册表，不运行时卸载（防蓝屏）；重启后即不再加载
+    Disable-AceDrivers | Out-Null
 }
 $lastBsod = @(Get-WinEvent -FilterHashtable @{LogName='System'; Id=41} -MaxEvents 1)
 if ($lastBsod.Count -and $lastBsod[0].TimeCreated -gt (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.AddMinutes(-2)) {
