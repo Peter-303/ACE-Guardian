@@ -10,13 +10,18 @@ $sf = "$Root\state.json"
 if (Test-Path $sf) {
     $age = ((Get-Date) - (Get-Item $sf).LastWriteTime).TotalSeconds
     $st  = Get-Content $sf -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($age -lt 90) {
+    # 休眠时心跳每 5 分钟一次，阈值需放宽否则误报已停止
+    $限 = if ($st.mode -eq 'Sleep') { 400 } else { 90 }
+    if ($age -lt $限) {
         Write-Host ("守护进程   : 运行中（心跳 {0} 秒前）" -f [math]::Round($age)) -ForegroundColor Green
     } else {
         Write-Host ("守护进程   : 可能已停止（心跳 {0} 分钟前）" -f [math]::Round($age/60)) -ForegroundColor Red
     }
     $manual = Test-Path "$Root\ACTIVE.flag"
-    if ($st.mode -eq 'Active') {
+    $sleeping = Test-Path "$Root\SILENT.flag"
+    if ($sleeping) {
+        Write-Host "运行模式   : 休眠（管控已暂停，不巡检不干预）" -ForegroundColor DarkGray
+    } elseif ($st.mode -eq 'Active') {
         Write-Host ("运行模式   : 激活态（密集监控中{0}）" -f $(if($manual){'，手动开启'}else{'，检测到游戏'})) -ForegroundColor Yellow
     } else {
         Write-Host "运行模式   : 静默态（低频巡检，等待游戏或手动开启）" -ForegroundColor Green

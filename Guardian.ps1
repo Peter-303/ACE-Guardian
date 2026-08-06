@@ -14,6 +14,7 @@ $Cfg  = Get-Content "$Root\config.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 $SnapDir   = "$Root\snapshots"
 $StateFile = "$Root\state.json"
 $FlagFile  = "$Root\ACTIVE.flag"      # 手动激活标记，由 开启守护.ps1 创建
+$SilentFile = "$Root\SILENT.flag"     # 强制静默标记，优先级高于一切自动判定
 $AlertDir  = "$Root\alerts"
 
 function Get-LogPath { "$Root\logs\guardian-{0}.log" -f (Get-Date -Format 'yyyyMMdd') }
@@ -85,6 +86,11 @@ function Get-AceProcs {
 }
 
 # ---------- 管控动作 ----------
+# 休眠标记：用户明确知道此刻不玩游戏（例如登录器只在下载），
+# 管控没有意义，纯属损耗。置位后守护停掉所有巡检与干预，只维持心跳。
+# 优先级最高，盖掉登录器/游戏本体自动判定与手动激活标记。
+function Test-休眠 { Test-Path $SilentFile }
+
 # 安全闸门统一判定：游戏本体或登录器在跑时，一律不干预 ACE。
 # 登录器在跑意味着即将进入游戏，此时动 ACE 会导致游戏进不去或被判定异常。
 function Test-干预禁止 {
@@ -344,7 +350,7 @@ if ($bootIssues.Count) {
     Write-Log '开机自检通过，进入静默态' 'PASS'
 }
 
-$state = @{ lastWhea=(Get-Date).ToString('o'); lastBsod=(Get-Date).ToString('o'); mode='Idle' }
+$state = @{ lastWhea=(Get-Date).ToString('o'); lastBsod=(Get-Date).ToString('o'); mode='Idle'; silent=$false }
 $mode = 'Idle'
 $prevGame = $false
 $idleTick = 0
@@ -353,6 +359,38 @@ $宽限秒 = if ($Cfg.游戏退出宽限秒) { $Cfg.游戏退出宽限秒 } else
 
 while ($true) {
     try {
+        # ---- 休眠短路：用户明确表示此刻不玩游戏，管控纯属损耗 ----
+        # 放在最前面，跳过进程枚举、注册表遍历、事件日志查询等全部开销，
+        # 只维持心跳供面板判断存活。每 5 分钟醒一次，仅检查标记是否被撤销。
+        if (Test-休眠) {
+            if ($mode -ne 'Sleep') {
+                # 进入休眠前若还在激活态，先做一次退场检查收尾，避免 ACE 残留在后台
+                if ($mode -eq 'Active') { Invoke-ExitCheck | Out-Null }
+                Write-Log '进入休眠（用户手动开启，停止巡检与干预）' 'WARN'
+                Send-Alert '管控已休眠' '已停止巡检与干预，几乎不占资源。下载完成准备开游戏前请手动恢复。' 'Info' 60
+                $mode = 'Sleep'
+                $prevGame = $false
+                $gameGoneAt = $null
+            }
+            $state.mode = 'Sleep'
+            $state.silent = $true
+            $state | ConvertTo-Json -Compress | Set-Content $StateFile -Encoding UTF8
+            # 分段睡眠：总时长按配置（默认 5 分钟），但每 10 秒检查一次标记是否被撤销，
+            # 这样用户取消休眠后能很快恢复，而不必等满一个周期。
+            # Test-Path 开销极小，与整轮巡检相比可忽略。
+            $总 = if ($Cfg.采集间隔秒_休眠) { $Cfg.采集间隔秒_休眠 } else { 300 }
+            for ($w = 0; $w -lt $总; $w += 10) {
+                Start-Sleep -Seconds 10
+                if (-not (Test-休眠)) { break }
+            }
+            continue
+        }
+        if ($mode -eq 'Sleep') {
+            Write-Log '退出休眠，恢复正常巡检' 'WARN'
+            Send-Alert '管控已恢复' '已恢复正常巡检，可以开游戏了。' 'Info' 10
+            $mode = 'Idle'
+        }
+
         $game     = Get-GameProcs        # 游戏本体
         $launcher = Get-LauncherProcs    # 登录器
         $rawGame  = ($game.Count -gt 0)
@@ -431,6 +469,7 @@ while ($true) {
         }
 
         $state.mode = $mode
+        $state.silent = $false
         $state | ConvertTo-Json -Compress | Set-Content $StateFile -Encoding UTF8
         Clear-OldFiles
         $prevGame = $inGame

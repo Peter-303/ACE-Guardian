@@ -3,6 +3,7 @@
 $ErrorActionPreference = 'Stop'
 $Root   = 'C:\ACE-Guardian'
 $Flag   = "$Root\ACTIVE.flag"
+$Sleep  = "$Root\SILENT.flag"    # 休眠标记：停止巡检与干预，省资源
 $StateF = "$Root\state.json"
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -12,6 +13,33 @@ $WndTitle = 'ACE 管控守护'
 
 # 单实例：Mutex 负责判定是否已有实例（可靠），命名事件仅负责通知已有实例显示窗口。
 # 不用 FindWindow，因为面板以 -WindowStyle Hidden 启动，顶层窗口搜不到。
+$DiagLog = "$Root\logs\panel-diag.log"
+function Write-Diag {
+    param([string]$Msg)
+    try { Add-Content -Path $DiagLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Msg" -Encoding UTF8 } catch { }
+}
+
+# 标记文件的建立/删除必须容错：守护进程（SYSTEM）可能正持有句柄，
+# 瞬时的共享冲突或权限波动不应把整个窗口掀翻（$ErrorActionPreference=Stop 会弹未处理异常框）。
+# 短暂重试几次，仍失败则记日志并返回 $false，让调用方据实提示，而不是崩溃。
+function Set-FlagFile {
+    param([string]$Path,[bool]$On)
+    for ($i = 0; $i -lt 5; $i++) {
+        try {
+            if ($On) {
+                if (-not (Test-Path $Path)) { Set-Content $Path (Get-Date -Format 'u') -Encoding UTF8 -ErrorAction Stop }
+            } else {
+                if (Test-Path $Path) { Remove-Item $Path -Force -ErrorAction Stop }
+            }
+            return $true
+        } catch {
+            Write-Diag "写标记失败(第$($i+1)次) $Path On=$On : $($_.Exception.Message)"
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    return $false
+}
+
 $evShow = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'Global\ACE-Guardian-Panel-Show')
 $mx = New-Object System.Threading.Mutex($false, 'Global\ACE-Guardian-Panel')
 # 上个实例被强杀时锁会变成 abandoned，WaitOne 抛异常但锁实际已获取，必须继续运行
@@ -31,23 +59,30 @@ $evShow.Reset() | Out-Null
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 function Get-Status {
-    $o = [ordered]@{ 存活=$false; 模式='未知'; 心跳秒=999; 手动=$false; ACE=@(); 游戏=@(); 登录器=@(); ACE进程=@(); 今日风险=0 }
+    $o = [ordered]@{ 存活=$false; 模式='未知'; 心跳秒=999; 手动=$false; 休眠=$false; ACE=@(); 游戏=@(); 登录器=@(); ACE进程=@(); 今日风险=0 }
     try {
         if (Test-Path $StateF) {
             $o.心跳秒 = [math]::Round(((Get-Date) - (Get-Item $StateF).LastWriteTime).TotalSeconds)
-            $o.存活   = ($o.心跳秒 -lt 90)
+            # 休眠时心跳间隔拉长到 5 分钟，存活判定要放宽，否则会误报"守护未运行"
             $st = Get-Content $StateF -Raw -Encoding UTF8 | ConvertFrom-Json
-            $o.模式 = if ($st.mode -eq 'Active') { '激活态' } else { '静默态' }
+            $o.模式 = switch ($st.mode) { 'Active' { '激活态' } 'Sleep' { '休眠' } default { '静默态' } }
+            $o.存活 = if ($st.mode -eq 'Sleep') { $o.心跳秒 -lt 400 } else { $o.心跳秒 -lt 90 }
         }
         $o.手动 = Test-Path $Flag
+        $o.休眠 = Test-Path $Sleep
         $cfg = Get-Content "$Root\config.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+        # 一次性拉全部驱动状态到哈希表，循环内查表即可。
+        # 原先循环内每个命中的服务都单独 Get-CimInstance -Filter，多次 WMI 往返累计要 3~4 秒，
+        # 在 UI 线程同步执行会拖住窗口首次显示，也让每次刷新都卡一下。
+        $drvState = @{}
+        Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue | ForEach-Object { $drvState[$_.Name] = $_.State }
         foreach ($k in Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services' -ErrorAction SilentlyContinue) {
             foreach ($p in $cfg.ACE服务前缀) {
                 if ($k.PSChildName -like "$p*") {
                     $pr  = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
                     $stt = switch ($pr.Start) { 0{'Boot'} 1{'System'} 2{'Auto'} 3{'Manual'} 4{'Disabled'} default{'?'} }
-                    $d   = Get-CimInstance Win32_SystemDriver -Filter "Name='$($k.PSChildName)'" -ErrorAction SilentlyContinue
-                    $o.ACE += [pscustomobject]@{ 名称=$k.PSChildName; 启动=$stt; 状态=$(if($d){$d.State}else{'-'}); 危险=($pr.Start -in 0,1,2) }
+                    $state = if ($drvState.ContainsKey($k.PSChildName)) { $drvState[$k.PSChildName] } else { '-' }
+                    $o.ACE += [pscustomobject]@{ 名称=$k.PSChildName; 启动=$stt; 状态=$state; 危险=($pr.Start -in 0,1,2) }
                     break
                 }
             }
@@ -64,7 +99,7 @@ function Get-Status {
 
 $f = New-Object System.Windows.Forms.Form
 $f.Text            = $WndTitle
-$f.ClientSize      = New-Object System.Drawing.Size(440,480)
+$f.ClientSize      = New-Object System.Drawing.Size(440,492)
 $f.StartPosition   = 'CenterScreen'
 $f.BackColor       = [System.Drawing.Color]::FromArgb(30,32,38)
 $f.ForeColor       = [System.Drawing.Color]::White
@@ -109,14 +144,14 @@ $box.BackColor = [System.Drawing.Color]::FromArgb(22,24,29)
 $box.ForeColor = [System.Drawing.Color]::FromArgb(210,215,225)
 $box.BorderStyle = 'FixedSingle'
 $box.Location = New-Object System.Drawing.Point(18,98)
-$box.Size = New-Object System.Drawing.Size(404,290)
+$box.Size = New-Object System.Drawing.Size(404,286)
 
 function New-Btn {
-    param([string]$Text,[int]$X,[int]$W,[System.Drawing.Color]$Bg)
+    param([string]$Text,[int]$X,[int]$Y,[int]$W,[System.Drawing.Color]$Bg)
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $Text; $b.Font = $fontN
-    $b.Location = New-Object System.Drawing.Point($X,404)
-    $b.Size = New-Object System.Drawing.Size($W,40)
+    $b.Location = New-Object System.Drawing.Point($X,$Y)
+    $b.Size = New-Object System.Drawing.Size($W,36)
     $b.FlatStyle = 'Flat'
     $b.FlatAppearance.BorderSize = 0
     $b.BackColor = $Bg
@@ -124,12 +159,15 @@ function New-Btn {
     $b.Cursor = [System.Windows.Forms.Cursors]::Hand
     return $b
 }
-$btnToggle  = New-Btn '开启守护' 18  130 ([System.Drawing.Color]::FromArgb(0,120,215))
-$btnRefresh = New-Btn '刷新'     158  84 ([System.Drawing.Color]::FromArgb(58,62,70))
-$btnLog     = New-Btn '查看日志' 250  90 ([System.Drawing.Color]::FromArgb(58,62,70))
-$btnClose   = New-Btn '关闭'     348  74 ([System.Drawing.Color]::FromArgb(58,62,70))
+# 第一行：核心开关（休眠优先级最高，放在最左）
+$btnSleep   = New-Btn '休眠管控' 18  398 130 ([System.Drawing.Color]::FromArgb(58,62,70))
+$btnToggle  = New-Btn '开启守护' 156 398 130 ([System.Drawing.Color]::FromArgb(0,120,215))
+# 第二行：辅助操作
+$btnRefresh = New-Btn '刷新'     294 398 128 ([System.Drawing.Color]::FromArgb(58,62,70))
+$btnLog     = New-Btn '查看日志' 18  440 130 ([System.Drawing.Color]::FromArgb(58,62,70))
+$btnClose   = New-Btn '关闭'     156 440 130 ([System.Drawing.Color]::FromArgb(58,62,70))
 
-$f.Controls.AddRange(@($lblTitle,$lblDot,$lblState,$chkAuto,$box,$btnToggle,$btnRefresh,$btnLog,$btnClose))
+$f.Controls.AddRange(@($lblTitle,$lblDot,$lblState,$chkAuto,$box,$btnSleep,$btnToggle,$btnRefresh,$btnLog,$btnClose))
 
 # $Force=$true 表示手动刷新，会重绘日志区；自动刷新只更新上方状态，不动日志区
 $refresh = {
@@ -138,6 +176,10 @@ $refresh = {
     if (-not $s.存活) {
         $lblDot.ForeColor = [System.Drawing.Color]::Gray
         $lblState.Text = "守护未运行`r`n请重启电脑，或检查计划任务 ACE-Guardian"
+    } elseif ($s.休眠) {
+        # 休眠优先展示：管控已停摆，用户需要清楚知道此时没有保护
+        $lblDot.ForeColor = [System.Drawing.Color]::FromArgb(120,130,150)
+        $lblState.Text = "休眠中 · 管控已暂停`r`n不巡检不干预，几乎不占资源。开游戏前请恢复"
     } elseif (@($s.ACE | Where-Object 危险).Count -gt 0) {
         $lblDot.ForeColor = [System.Drawing.Color]::FromArgb(255,170,0)
         $lblState.Text = "ACE 被设为开机常驻`r`n将在游戏关闭后改为按需加载"
@@ -149,6 +191,13 @@ $refresh = {
         $lblDot.ForeColor = [System.Drawing.Color]::FromArgb(40,180,80)
         $lblState.Text = "静默态 · 一切正常`r`n低频巡检中，等待游戏启动或手动开启"
     }
+    if ($s.休眠) {
+        $btnSleep.Text = '恢复管控'
+        $btnSleep.BackColor = [System.Drawing.Color]::FromArgb(40,150,90)
+    } else {
+        $btnSleep.Text = '休眠管控'
+        $btnSleep.BackColor = [System.Drawing.Color]::FromArgb(58,62,70)
+    }
     if ($s.手动) {
         $btnToggle.Text = '关闭守护'
         $btnToggle.BackColor = [System.Drawing.Color]::FromArgb(200,80,40)
@@ -156,6 +205,8 @@ $refresh = {
         $btnToggle.Text = '开启守护'
         $btnToggle.BackColor = [System.Drawing.Color]::FromArgb(0,120,215)
     }
+    # 休眠期间"开启守护"没有意义，禁用以免语义打架
+    $btnToggle.Enabled = -not $s.休眠
 
     # 非强制刷新时不重绘日志区，避免正在看日志被打断
     if (-not $Force -and $box.Text.Length -gt 0) { return }
@@ -164,6 +215,7 @@ $refresh = {
     [void]$sb.AppendLine("心跳         : $($s.心跳秒) 秒前")
     [void]$sb.AppendLine("运行模式     : $($s.模式)")
     [void]$sb.AppendLine("手动激活     : $(if($s.手动){'是'}else{'否'})")
+    [void]$sb.AppendLine("休眠         : $(if($s.休眠){'是（已暂停巡检与干预）'}else{'否'})")
     [void]$sb.AppendLine("游戏本体     : $(if($s.游戏){$s.游戏 -join ', '}else{'未运行'})")
     [void]$sb.AppendLine("登录器       : $(if($s.登录器){$s.登录器 -join ', '}else{'未运行'})")
     [void]$sb.AppendLine("ACE 进程     : $(if($s.ACE进程){$s.ACE进程 -join ', '}else{'未运行'})")
@@ -192,9 +244,29 @@ $refresh = {
 $btnRefresh.Add_Click({ & $refresh $true })
 $btnClose.Add_Click({ $f.Close() })
 $btnLog.Add_Click({ Start-Process explorer.exe "$Root\logs" })
+$btnSleep.Add_Click({
+    $on = -not (Test-Path $Sleep)   # 当前没标记 => 本次要开启休眠
+    $ok = Set-FlagFile $Sleep $on
+    # 开启休眠时同步撤掉手动激活标记（两者语义互斥）
+    if ($ok -and $on) { [void](Set-FlagFile $Flag $false) }
+    if (-not $ok) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "切换休眠状态失败：无法写入 $Sleep`r`n可能被守护进程占用或权限不足，详见 logs\panel-diag.log",
+            'ACE 管控守护', 'OK', 'Warning') | Out-Null
+    }
+    Start-Sleep -Milliseconds 800
+    & $refresh $true
+})
 $btnToggle.Add_Click({
-    if (Test-Path $Flag) { Remove-Item $Flag -Force }
-    else { Set-Content $Flag (Get-Date -Format 'u') -Encoding UTF8 }
+    $on = -not (Test-Path $Flag)    # 当前没标记 => 本次要开启守护
+    $ok = Set-FlagFile $Flag $on
+    # 手动开启守护时解除休眠，否则守护还睡着，开关不起作用
+    if ($ok -and $on) { [void](Set-FlagFile $Sleep $false) }
+    if (-not $ok) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "切换守护状态失败：无法写入 $Flag`r`n可能被守护进程占用或权限不足，详见 logs\panel-diag.log",
+            'ACE 管控守护', 'OK', 'Warning') | Out-Null
+    }
     Start-Sleep -Milliseconds 600
     & $refresh $true
 })
